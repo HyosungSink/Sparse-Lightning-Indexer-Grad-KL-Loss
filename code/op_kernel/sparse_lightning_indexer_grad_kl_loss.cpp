@@ -120,6 +120,8 @@ class SparseGrad {
     LocalTensor<uint8_t> raw;
     LocalTensor<float> mainQuery, mainRope, mainKeys, mainKeyRopes;
     bool cachedMain;
+    LocalTensor<float> pairMainScores;
+    bool cachePairMain, pairMainReady;
     uint32_t stride;
     uint64_t simOffset, massOffset, logitOffset;
 
@@ -233,7 +235,12 @@ public:
             t.queryHeads*t.queryDim<=1024 && t.queryHeads*t.ropeDim<=256 &&
             static_cast<uint64_t>(t.keyRows)*t.queryDim<=4096 &&
             static_cast<uint64_t>(t.keyRows)*t.ropeDim<=1024;
-        pipe.InitBuffer(storage, (2*cacheSize + 512*8 + 128*4 + 64 + (cachedMain?6400:0))*sizeof(float));
+        cachePairMain = AscendC::IsSameType<T,float>::value &&
+            static_cast<uint64_t>(t.keyRows)*t.queryHeads <= 4096;
+        pairMainReady = false;
+        uint32_t pairCacheSize = cachePairMain ? 2*t.keyRows*t.queryHeads : 0;
+        pipe.InitBuffer(storage, (2*cacheSize + 512*8 + 128*4 + 64 +
+            (cachedMain?6400:0) + pairCacheSize)*sizeof(float));
         auto mem = storage.Get<float>();
         a = mem; b = mem[512]; product = mem[1024]; temporary = mem[1536]; result = mem[2048];
         raw = mem[2560].ReinterpretCast<uint8_t>();
@@ -244,6 +251,7 @@ public:
             mainQuery=weightOut[128]; mainRope=mainQuery[1024];
             mainKeys=mainRope[256]; mainKeyRopes=mainKeys[4096];
         }
+        if (cachePairMain) pairMainScores=weightOut[128];
         simOffset = (static_cast<uint64_t>(t.keyRows)*t.indexDim+15)/16*16;
         massOffset = simOffset + static_cast<uint64_t>(t.sparseSize)*t.indexHeads;
         logitOffset = massOffset + t.sparseSize;
@@ -263,11 +271,18 @@ public:
         }
         return sum;
     }
-    __aicore__ inline SliPair PairMain(uint32_t batch,uint32_t row,uint32_t head,uint32_t key) {
+    __aicore__ inline SliPair PairMainRaw(uint32_t batch,uint32_t row,uint32_t head,uint32_t key) {
         uint64_t qo=(static_cast<uint64_t>(batch)*t.queryRows+row)*t.queryHeads+head;
         uint64_t ko=static_cast<uint64_t>(batch)*t.keyRows+key;
         return (PairDot(q,qo*t.queryDim,k,ko*t.queryDim,t.queryDim)+
                 PairDot(qr,qo*t.ropeDim,kr,ko*t.ropeDim,t.ropeDim))*SliPair(t.scale);
+    }
+    __aicore__ inline SliPair PairMain(uint32_t batch,uint32_t row,uint32_t head,uint32_t key) {
+        if (pairMainReady) {
+            uint32_t offset=2*(head*t.keyRows+key);
+            return SliPair(pairMainScores.GetValue(offset),pairMainScores.GetValue(offset+1));
+        }
+        return PairMainRaw(batch,row,head,key);
     }
     template<bool Accurate>
     __aicore__ inline void FinishBatch(uint32_t batch, uint64_t keyCount) {
@@ -323,6 +338,19 @@ public:
                     SliPair headNorm[128], headScore[128], gradW[64];
                     for(uint32_t h=0;h<t.indexHeads;++h) gradW[h]=SliPair(0);
                     int64_t visible=static_cast<int64_t>(row)+klen-qlen+1;
+                    pairMainReady=false;
+                    if (cachePairMain) {
+                        // The same high-precision score feeds max, sum, and sparse mass.
+                        for(uint32_t h=0;h<t.queryHeads;++h) {
+                            for(int64_t key=0;key<visible;++key) {
+                                SliPair value=PairMainRaw(batch,row,h,key);
+                                uint32_t offset=2*(h*t.keyRows+key);
+                                pairMainScores.SetValue(offset,value.hi);
+                                pairMainScores.SetValue(offset+1,value.lo);
+                            }
+                        }
+                        pairMainReady=true;
+                    }
                     // FP32 compatibility inputs may carry rounded statistics. Reconstruct
                     // the visible normalizer with the same precision as the sparse scores.
                     for(uint32_t h=0;h<t.queryHeads;++h) {
