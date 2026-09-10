@@ -542,6 +542,287 @@ public:
     }
 };
 
+// Each worker keeps a bounded working set in UB and owns a contiguous query range.
+template<class T, class W, class QR, class KR>
+class SparseCompact {
+    SparseLightningIndexerGradKlLossTilingData t;
+    TBuf<TPosition::VECCALC> storage;
+    LocalTensor<float> q,k,qi,ki,w,mx,sm,qr,kr;
+    LocalTensor<float> rq,rk,rqi,rki,rw,rqr,rkr,dq,dk,dw,outLoss,rdq,rdk,rdw;
+    LocalTensor<float> product,reduction,ha,hb,headMax,headSum,weight,similarity,ds,broadcast,simStore;
+    LocalTensor<float> mass,logits,target,predicted,di,logTarget,logPred,aux;
+    LocalTensor<uint8_t> mask;
+    LocalTensor<int32_t> indices;
+    GlobalTensor<int32_t> ql32,kl32;
+    GlobalTensor<int64_t> ql64,kl64;
+    GM_ADDR dqAddr;
+    GM_ADDR dkAddr;
+    GM_ADDR dwAddr;
+    GM_ADDR lossAddr;
+    GM_ADDR workAddr;
+    uint32_t qCount,kCount,qiCount,kiCount,wCount,statsCount,qrCount,krCount;
+
+    template<class U>
+    __aicore__ inline void CopyIn(LocalTensor<float> converted,LocalTensor<float> raw,GM_ADDR address,uint32_t count) {
+        GlobalTensor<U> source; source.SetGlobalBuffer((__gm__ U*)address);
+        DataCopyExtParams params{1,static_cast<uint32_t>(count*sizeof(U)),0,0,0};
+        if constexpr (AscendC::IsSameType<U,float>::value)
+            DataCopyPad(converted,source,params,DataCopyPadExtParams<float>{false,0,0,0});
+        else DataCopyPad(raw.ReinterpretCast<U>(),source,params,DataCopyPadExtParams<U>{false,0,0,0});
+    }
+    template<class U>
+    __aicore__ inline void Decode(LocalTensor<float> converted,LocalTensor<float> raw,uint32_t count) {
+        if constexpr (!AscendC::IsSameType<U,float>::value)
+            Cast(converted,raw.ReinterpretCast<U>(),RoundMode::CAST_NONE,count);
+    }
+    template<class U>
+    __aicore__ inline void Encode(LocalTensor<float> raw,LocalTensor<float> source,uint32_t count) {
+        if constexpr (!AscendC::IsSameType<U,float>::value)
+            Cast(raw.ReinterpretCast<U>(),source,RoundMode::CAST_RINT,count);
+    }
+    template<class U>
+    __aicore__ inline void CopyOut(GM_ADDR address,LocalTensor<float> converted,LocalTensor<float> raw,uint32_t count) {
+        GlobalTensor<U> destination; destination.SetGlobalBuffer((__gm__ U*)address);
+        DataCopyExtParams params{1,static_cast<uint32_t>(count*sizeof(U)),0,0,0};
+        if constexpr (AscendC::IsSameType<U,float>::value) DataCopyPad(destination,converted,params);
+        else DataCopyPad(destination,raw.ReinterpretCast<U>(),params);
+    }
+    __aicore__ inline uint32_t Length(bool query,uint32_t batch) {
+        uint32_t type=query?t.queryLengthType:t.keyLengthType;
+        uint32_t bound=query?t.queryRows:t.keyRows;
+        if(!type) return bound;
+        int64_t value=type==1?(query?ql32.GetValue(batch):kl32.GetValue(batch)):
+                              (query?ql64.GetValue(batch):kl64.GetValue(batch));
+        return value<0?0:(value>bound?bound:static_cast<uint32_t>(value));
+    }
+    __aicore__ inline bool Valid(int32_t key,uint32_t row,uint32_t qlen,uint32_t klen) {
+        return key>=0 && key<static_cast<int32_t>(klen) && key<=static_cast<int64_t>(row)+klen-qlen;
+    }
+    __aicore__ inline void MainDot(uint32_t token,uint32_t batch,uint32_t key) {
+        uint8_t span=static_cast<uint8_t>(t.queryDim/8);
+        Mul(product,q[token*t.queryHeads*t.queryDim],k[(batch*t.keyRows+key)*t.queryDim],
+            static_cast<uint64_t>(t.queryDim),static_cast<uint8_t>(t.queryHeads),{1,1,1,span,span,0});
+        PipeBarrier<PIPE_V>();
+        WholeReduceSum(ha,product,t.queryDim,t.queryHeads,1,1,span);
+        PipeBarrier<PIPE_V>();
+        span=static_cast<uint8_t>(t.ropeDim/8);
+        Mul(product,qr[token*t.queryHeads*t.ropeDim],kr[(batch*t.keyRows+key)*t.ropeDim],
+            static_cast<uint64_t>(t.ropeDim),static_cast<uint8_t>(t.queryHeads),{1,1,1,span,span,0});
+        PipeBarrier<PIPE_V>();
+        WholeReduceSum(hb,product,t.ropeDim,t.queryHeads,1,1,span);
+        PipeBarrier<PIPE_V>();
+        Add(ha,ha,hb,t.queryHeads); PipeBarrier<PIPE_V>();
+        Muls(ha,ha,t.scale,t.queryHeads); PipeBarrier<PIPE_V>();
+    }
+    __aicore__ inline void StableTarget(uint32_t token,uint32_t batch,uint32_t row,uint32_t qlen,uint32_t klen) {
+        Ln(headSum,headSum,t.queryHeads); PipeBarrier<PIPE_V>();
+        Duplicate(mass,-3.4e38f,64); PipeBarrier<PIPE_V>();
+        for(uint32_t j=0;j<t.sparseSize;++j) {
+            int32_t key=indices.GetValue(token*t.sparseSize+j);
+            if(!Valid(key,row,qlen,klen)) continue;
+            MainDot(token,batch,key);
+            Sub(ha,ha,headMax,t.queryHeads); PipeBarrier<PIPE_V>();
+            Sub(ha,ha,headSum,t.queryHeads); PipeBarrier<PIPE_V>();
+            WholeReduceMax(reduction,ha,t.queryHeads,1,1,1,8); PipeBarrier<PIPE_ALL>();
+            float peak=reduction.GetValue(0);
+            Adds(ha,ha,-peak,t.queryHeads); PipeBarrier<PIPE_V>();
+            Exp(ha,ha,t.queryHeads); PipeBarrier<PIPE_V>();
+            WholeReduceSum(reduction,ha,t.queryHeads,1,1,1,8); PipeBarrier<PIPE_ALL>();
+            mass.SetValue(j,peak+SliLog(reduction.GetValue(0)));
+        }
+        PipeBarrier<PIPE_ALL>();
+        WholeReduceMax(reduction,mass,t.sparseSize,1,1,1,8); PipeBarrier<PIPE_ALL>();
+        float peak=reduction.GetValue(0);
+        Adds(target,mass,-peak,t.sparseSize); PipeBarrier<PIPE_V>();
+        Exp(target,target,t.sparseSize); PipeBarrier<PIPE_V>();
+        WholeReduceSum(reduction,target,t.sparseSize,1,1,1,8); PipeBarrier<PIPE_ALL>();
+        Muls(target,target,1.0f/reduction.GetValue(0),t.sparseSize); PipeBarrier<PIPE_V>();
+    }
+public:
+    __aicore__ inline void Init(GM_ADDR query,GM_ADDR key,GM_ADDR queryIndex,GM_ADDR keyIndex,
+        GM_ADDR weights,GM_ADDR sparseIndices,GM_ADDR softmaxMax,GM_ADDR softmaxSum,
+        GM_ADDR queryRope,GM_ADDR keyRope,GM_ADDR actualQ,GM_ADDR actualK,
+        GM_ADDR dQuery,GM_ADDR dKey,GM_ADDR dWeight,GM_ADDR outputLoss,GM_ADDR workspace,
+        const SparseLightningIndexerGradKlLossTilingData &tiling,TPipe *pipe) {
+        t=tiling;
+        // Maximum live UB allocation is 132096 bytes; Host bounds every tensor.
+        pipe->InitBuffer(storage,33024*sizeof(float));
+        auto mem=storage.Get<float>();
+        q=mem; k=mem[4096]; qi=mem[8192]; ki=mem[10240]; w=mem[12288];
+        mx=mem[12416]; sm=mem[12544]; qr=mem[12672]; kr=mem[13696];
+        rq=mem[14720]; rk=mem[16768]; rqi=mem[18816]; rki=mem[19840]; rw=mem[20864];
+        rqr=mem[20992]; rkr=mem[21504]; dq=mem[22016]; dk=mem[24064]; dw=mem[26112];
+        outLoss=mem[26240]; rdq=mem[26248]; rdk=mem[27272]; rdw=mem[28296];
+        product=mem[28424]; reduction=mem[29448]; ha=mem[30472]; hb=mem[30600];
+        headMax=mem[30728]; headSum=mem[30856]; weight=mem[30984]; similarity=mem[31048];
+        ds=mem[31112]; broadcast=mem[31176]; simStore=mem[31688]; mass=mem[32200];
+        logits=mem[32264]; target=mem[32328]; predicted=mem[32392]; di=mem[32456];
+        logTarget=mem[32520]; logPred=mem[32584]; aux=mem[32648];
+        mask=mem[32776].ReinterpretCast<uint8_t>(); indices=mem[32840].ReinterpretCast<int32_t>();
+        dqAddr=dQuery; dkAddr=dKey; dwAddr=dWeight; lossAddr=outputLoss; workAddr=workspace;
+        ql32.SetGlobalBuffer((__gm__ int32_t*)actualQ); kl32.SetGlobalBuffer((__gm__ int32_t*)actualK);
+        ql64.SetGlobalBuffer((__gm__ int64_t*)actualQ); kl64.SetGlobalBuffer((__gm__ int64_t*)actualK);
+        GlobalTensor<float> output; output.SetGlobalBuffer((__gm__ float*)outputLoss);
+        DataCacheCleanAndInvalid<float,CacheLine::ENTIRE_DATA_CACHE>(output);
+        uint32_t tokens=t.batch*t.queryRows,keys=t.batch*t.keyRows;
+        qCount=tokens*t.queryHeads*t.queryDim; kCount=keys*t.queryDim;
+        qiCount=tokens*t.indexHeads*t.indexDim; kiCount=keys*t.indexDim;
+        wCount=tokens*t.indexHeads; statsCount=tokens*t.queryHeads;
+        qrCount=tokens*t.queryHeads*t.ropeDim; krCount=keys*t.ropeDim;
+        CopyIn<T>(q,rq,query,qCount); CopyIn<T>(k,rk,key,kCount);
+        CopyIn<T>(qi,rqi,queryIndex,qiCount); CopyIn<T>(ki,rki,keyIndex,kiCount);
+        CopyIn<W>(w,rw,weights,wCount); CopyIn<QR>(qr,rqr,queryRope,qrCount); CopyIn<KR>(kr,rkr,keyRope,krCount);
+        CopyIn<float>(mx,mx,softmaxMax,statsCount); CopyIn<float>(sm,sm,softmaxSum,statsCount);
+        GlobalTensor<int32_t> indexGm; indexGm.SetGlobalBuffer((__gm__ int32_t*)sparseIndices);
+        DataCopyPad(indices,indexGm,DataCopyExtParams{1,tokens*t.sparseSize*4,0,0,0},
+                    DataCopyPadExtParams<int32_t>{false,0,0,0});
+        PipeBarrier<PIPE_ALL>();
+        Decode<T>(q,rq,qCount); Decode<T>(k,rk,kCount); Decode<T>(qi,rqi,qiCount); Decode<T>(ki,rki,kiCount);
+        Decode<W>(w,rw,wCount); Decode<QR>(qr,rqr,qrCount); Decode<KR>(kr,rkr,krCount);
+        Duplicate(dq,0.0f,qiCount); Duplicate(dk,0.0f,kiCount); Duplicate(dw,0.0f,wCount);
+        Duplicate(weight,0.0f,64); Duplicate(similarity,0.0f,64);
+        PipeBarrier<PIPE_ALL>();
+    }
+    __aicore__ inline void Process() {
+        float total=0,correction=0;
+        uint32_t simStride=(t.indexHeads+7)/8*8;
+        uint32_t tokens=t.batch*t.queryRows;
+        uint32_t begin=tokens*GetBlockIdx()/t.cores,end=tokens*(GetBlockIdx()+1)/t.cores;
+        for(uint32_t batch=0;batch<t.batch;++batch) {
+            uint32_t qlen=Length(true,batch),klen=Length(false,batch);
+            for(uint32_t row=0;row<qlen;++row) {
+                uint32_t token=batch*t.queryRows+row,validCount=0;
+                if(token<begin || token>=end) continue;
+                int32_t firstKey=-1;
+                bool distinctKeys=false;
+                for(uint32_t h=0;h<t.queryHeads;++h) {
+                    uint32_t offset=batch*t.queryRows*t.queryHeads+(t.statsLayout?h*t.queryRows+row:row*t.queryHeads+h);
+                    headMax.SetValue(h,mx.GetValue(offset)); headSum.SetValue(h,sm.GetValue(offset));
+                }
+                for(uint32_t h=0;h<t.indexHeads;++h) weight.SetValue(h,w.GetValue(token*t.indexHeads+h));
+                Duplicate(mass,0.0f,64); Duplicate(logits,-3.4e38f,64); PipeBarrier<PIPE_ALL>();
+                for(uint32_t j=0;j<t.sparseSize;++j) {
+                    int32_t key=indices.GetValue(token*t.sparseSize+j);
+                    if(!Valid(key,row,qlen,klen)) continue;
+                    ++validCount;
+                    if(firstKey<0) firstKey=key;
+                    else if(key!=firstKey) distinctKeys=true;
+                    MainDot(token,batch,key);
+                    Sub(ha,ha,headMax,t.queryHeads); PipeBarrier<PIPE_V>();
+                    Exp(ha,ha,t.queryHeads); PipeBarrier<PIPE_V>();
+                    Div(ha,ha,headSum,t.queryHeads); PipeBarrier<PIPE_V>();
+                    WholeReduceSum(mass[j],ha,t.queryHeads,1,1,1,8); PipeBarrier<PIPE_V>();
+                    uint8_t span=static_cast<uint8_t>(t.indexDim/8);
+                    Mul(product,qi[token*t.indexHeads*t.indexDim],ki[(batch*t.keyRows+key)*t.indexDim],
+                        static_cast<uint64_t>(t.indexDim),static_cast<uint8_t>(t.indexHeads),{1,1,1,span,span,0});
+                    PipeBarrier<PIPE_V>();
+                    WholeReduceSum(similarity,product,t.indexDim,t.indexHeads,1,1,span); PipeBarrier<PIPE_V>();
+                    Relu(similarity,similarity,64); PipeBarrier<PIPE_V>();
+                    DataCopy(simStore[j*simStride],similarity,simStride); PipeBarrier<PIPE_V>();
+                    Mul(ds,similarity,weight,64); PipeBarrier<PIPE_V>();
+                    WholeReduceSum(logits[j],ds,t.indexHeads,1,1,1,8); PipeBarrier<PIPE_V>();
+                }
+                // Repeated copies of a single key give identical uniform distributions.
+                if(!distinctKeys) continue;
+                WholeReduceSum(reduction,mass,t.sparseSize,1,1,1,8);
+                WholeReduceMax(reduction[8],logits,t.sparseSize,1,1,1,8); PipeBarrier<PIPE_ALL>();
+                float massSum=reduction.GetValue(0),peak=reduction.GetValue(8);
+                if(massSum>1e-20f) { Muls(target,mass,1.0f/massSum,t.sparseSize); PipeBarrier<PIPE_V>(); }
+                else StableTarget(token,batch,row,qlen,klen);
+                Adds(logPred,logits,-peak,t.sparseSize); PipeBarrier<PIPE_V>();
+                Exp(predicted,logPred,t.sparseSize); PipeBarrier<PIPE_V>();
+                WholeReduceSum(reduction,predicted,t.sparseSize,1,1,1,8); PipeBarrier<PIPE_ALL>();
+                float normalizer=reduction.GetValue(0);
+                Muls(predicted,predicted,1.0f/normalizer,t.sparseSize); PipeBarrier<PIPE_V>();
+                Sub(di,predicted,target,t.sparseSize); PipeBarrier<PIPE_V>();
+                CompareScalar(mask,target,0.0f,CMPMODE::GT,64); PipeBarrier<PIPE_V>();
+                Select(logTarget,mask,target,1.0f,SELMODE::VSEL_TENSOR_SCALAR_MODE,t.sparseSize); PipeBarrier<PIPE_V>();
+                Ln(logTarget,logTarget,t.sparseSize); PipeBarrier<PIPE_V>();
+                Adds(logPred,logPred,-SliLog(normalizer),t.sparseSize); PipeBarrier<PIPE_V>();
+                Sub(aux,logTarget,logPred,t.sparseSize); PipeBarrier<PIPE_V>();
+                Mul(aux,aux,target,t.sparseSize); PipeBarrier<PIPE_V>();
+                WholeReduceSum(reduction,aux,t.sparseSize,1,1,1,8); PipeBarrier<PIPE_ALL>();
+                SliSum(reduction.GetValue(0),total,correction);
+                Duplicate(ha,0.0f,64); PipeBarrier<PIPE_V>();
+                for(uint32_t j=0;j<t.sparseSize;++j) {
+                    int32_t key=indices.GetValue(token*t.sparseSize+j);
+                    if(!Valid(key,row,qlen,klen)) continue;
+                    float gradient=di.GetValue(j);
+                    Muls(ds,weight,gradient,64); PipeBarrier<PIPE_V>();
+                    CompareScalar(mask,simStore[j*simStride],0.0f,CMPMODE::GT,64); PipeBarrier<PIPE_V>();
+                    Select(ds,mask,ds,0.0f,SELMODE::VSEL_TENSOR_SCALAR_MODE,t.indexHeads); PipeBarrier<PIPE_V>();
+                    Brcb(broadcast,ds,static_cast<uint8_t>((t.indexHeads+7)/8),{1,8}); PipeBarrier<PIPE_V>();
+                    uint8_t span=static_cast<uint8_t>(t.indexDim/8);
+                    uint32_t qo=token*t.indexHeads*t.indexDim,ko=(batch*t.keyRows+key)*t.indexDim;
+                    Mul(product,ki[ko],broadcast,static_cast<uint64_t>(t.indexDim),static_cast<uint8_t>(t.indexHeads),
+                        {1,1,0,span,0,1}); PipeBarrier<PIPE_V>();
+                    Add(dq[qo],dq[qo],product,t.indexHeads*t.indexDim); PipeBarrier<PIPE_V>();
+                    Mul(product,qi[qo],broadcast,static_cast<uint64_t>(t.indexDim),static_cast<uint8_t>(t.indexHeads),
+                        {1,1,0,span,span,1}); PipeBarrier<PIPE_V>();
+                    uint32_t heads=t.indexHeads;
+                    while(heads>1) {
+                        uint32_t half=(heads+1)/2;
+                        Add(product,product,product[half*t.indexDim],(heads/2)*t.indexDim); PipeBarrier<PIPE_V>();
+                        heads=half;
+                    }
+                    Add(dk[ko],dk[ko],product,t.indexDim); PipeBarrier<PIPE_V>();
+                    Muls(hb,simStore[j*simStride],gradient,t.indexHeads); PipeBarrier<PIPE_V>();
+                    Add(ha,ha,hb,t.indexHeads); PipeBarrier<PIPE_V>();
+                }
+                PipeBarrier<PIPE_ALL>();
+                for(uint32_t h=0;h<t.indexHeads;++h) dw.SetValue(token*t.indexHeads+h,ha.GetValue(h));
+            }
+        }
+        uint32_t localQi=(end-begin)*t.indexHeads*t.indexDim;
+        uint32_t qiBegin=begin*t.indexHeads*t.indexDim;
+        uint32_t localW=(end-begin)*t.indexHeads;
+        for(uint32_t i=0;i<localW;++i) hb.SetValue(i,dw.GetValue(begin*t.indexHeads+i));
+        outLoss.SetValue(0,total); PipeBarrier<PIPE_ALL>();
+        Encode<T>(rdq,dq[qiBegin],localQi); Encode<W>(rdw,hb,localW);
+        PipeBarrier<PIPE_ALL>();
+        CopyOut<T>(dqAddr+qiBegin*sizeof(T),dq[qiBegin],rdq,localQi);
+        CopyOut<W>(dwAddr+begin*t.indexHeads*sizeof(W),hb,rdw,localW);
+        if(t.cores==1) {
+            Encode<T>(rdk,dk,kiCount); PipeBarrier<PIPE_ALL>();
+            CopyOut<T>(dkAddr,dk,rdk,kiCount); CopyOut<float>(lossAddr,outLoss,outLoss,1);
+            PipeBarrier<PIPE_ALL>();
+            return;
+        }
+        uint64_t lossOffset=(kiCount+15)/16*16;
+        uint64_t own=GetBlockIdx()*t.batchScratch;
+        CopyOut<float>(workAddr+own*4,dk,dk,kiCount);
+        CopyOut<float>(workAddr+(own+lossOffset)*4,outLoss,outLoss,1);
+        SyncAll();
+        GlobalTensor<float> partial; partial.SetGlobalBuffer((__gm__ float*)workAddr);
+        uint32_t chunk=((kiCount+t.cores-1)/t.cores+7)/8*8;
+        uint32_t keyBegin=GetBlockIdx()*chunk;
+        if(keyBegin<kiCount) {
+            uint32_t n=kiCount-keyBegin<chunk?kiCount-keyBegin:chunk;
+            // One strided DMA gathers every worker's partial for this output range.
+            DataCopyPad(product,partial[keyBegin],
+                DataCopyExtParams{static_cast<uint16_t>(t.cores),n*4,static_cast<uint32_t>((t.batchScratch-n)*4),0,0},
+                DataCopyPadExtParams<float>{false,0,0,0});
+            PipeBarrier<PIPE_ALL>();
+            for(uint32_t peer=1;peer<t.cores;++peer) {
+                Add(product,product,product[peer*n],n); PipeBarrier<PIPE_V>();
+            }
+            Encode<T>(rdk,product,n); PipeBarrier<PIPE_ALL>();
+            CopyOut<T>(dkAddr+keyBegin*sizeof(T),product,rdk,n);
+        }
+        if(GetBlockIdx()==0) {
+            DataCopyPad(ha,partial[lossOffset],
+                DataCopyExtParams{static_cast<uint16_t>(t.cores),4,static_cast<uint32_t>((t.batchScratch-1)*4),0,0},
+                DataCopyPadExtParams<float>{false,0,0,0});
+            PipeBarrier<PIPE_ALL>();
+            float value=0,error=0;
+            for(uint32_t peer=0;peer<t.cores;++peer) SliSum(ha.GetValue(peer*8),value,error);
+            outLoss.SetValue(0,value); PipeBarrier<PIPE_ALL>();
+            CopyOut<float>(lossAddr,outLoss,outLoss,1);
+        }
+        PipeBarrier<PIPE_ALL>();
+    }
+};
+
 template<typename DT_QUERY, typename DT_WEIGHT, typename DT_QROPE, typename DT_KROPE>
 __global__ __aicore__ void sparse_lightning_indexer_grad_kl_loss(
     GM_ADDR query, GM_ADDR key, GM_ADDR queryIndex, GM_ADDR keyIndex, GM_ADDR weights,
@@ -551,6 +832,16 @@ __global__ __aicore__ void sparse_lightning_indexer_grad_kl_loss(
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIV_1_0);
     REGISTER_TILING_DEFAULT(SparseLightningIndexerGradKlLossTilingData);
     GET_TILING_DATA_WITH_STRUCT(SparseLightningIndexerGradKlLossTilingData,t,tiling);
+    if constexpr (AscendC::IsSameType<DT_QUERY,half>::value) {
+        if (t.compact) {
+            TPipe compactPipe;
+            SparseCompact<DT_QUERY,DT_WEIGHT,DT_QROPE,DT_KROPE> compactOp;
+            compactOp.Init(query,key,queryIndex,keyIndex,weights,sparseIndices,softmaxMax,softmaxSum,
+                queryRope,keyRope,actualQ,actualK,dQuery,dKey,dWeight,loss,GetUserWorkspace(workspace),t,&compactPipe);
+            compactOp.Process();
+            return;
+        }
+    }
     SparseGrad<DT_QUERY,DT_WEIGHT,DT_QROPE,DT_KROPE> op;
     op.Init(query,key,queryIndex,keyIndex,weights,sparseIndices,softmaxMax,softmaxSum,
         queryRope,keyRope,actualQ,actualK,dQuery,dKey,dWeight,loss,GetUserWorkspace(workspace),t);

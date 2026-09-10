@@ -91,11 +91,26 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
     uint32_t available = std::max(1U, static_cast<uint32_t>(platform.GetCoreNumAiv()));
     t.rowWorkers = std::max(1U, std::min(t.queryRows, available / t.batch));
     t.cores = std::min(t.batch, available) * t.rowWorkers;
+    uint64_t tokens = static_cast<uint64_t>(t.batch) * t.queryRows;
+    uint64_t keys = static_cast<uint64_t>(t.batch) * t.keyRows;
+    t.compact = core == ge::DT_FLOAT16 && !t.empty && tokens <= 8 &&
+        t.queryDim <= 64 && t.indexDim <= 64 && t.ropeDim <= 64 &&
+        t.queryDim % 8 == 0 && t.indexDim % 8 == 0 && t.ropeDim % 8 == 0 &&
+        t.queryHeads <= 64 && t.sparseSize <= 8 &&
+        t.queryHeads * t.queryDim <= 1024 && t.indexHeads * t.indexDim <= 512 &&
+        tokens*t.queryHeads*t.queryDim <= 4096 && keys*t.queryDim <= 4096 &&
+        tokens*t.indexHeads*t.indexDim <= 2048 && keys*t.indexDim <= 2048 &&
+        tokens*t.indexHeads <= 128 && tokens*t.queryHeads <= 128 &&
+        tokens*t.queryHeads*t.ropeDim <= 1024 && keys*t.ropeDim <= 1024;
+    uint64_t ubBytes = 0;
+    platform.GetCoreMemSize(platform_ascendc::CoreMemType::UB, ubBytes);
+    t.compact = t.compact && ubBytes >= 132096;
+    if (t.compact) { t.cores = std::min(available, static_cast<uint32_t>((tokens+1)/2)); t.rowWorkers = 1; }
     // Each worker owns a padded scratch region, including the FP32 scatter accumulator.
     uint64_t scratch = static_cast<uint64_t>(t.keyRows) * t.indexDim +
                        static_cast<uint64_t>(t.sparseSize) * (t.indexHeads + 4) + 16;
     if (core == ge::DT_FLOAT) scratch = 2 * (scratch + t.indexHeads * t.indexDim + t.queryHeads) + 64;
-    t.batchScratch = (scratch + 15) / 16 * 16;
+    t.batchScratch = t.compact ? (keys*t.indexDim + 15)/16*16 + 16 : (scratch + 15)/16*16;
     *context->GetTilingData<Tiling>() = t;
     uint32_t DT_QUERY = core, DT_WEIGHT = wt, DT_QROPE = in[8]->GetDataType(), DT_KROPE = in[9]->GetDataType();
     ASCENDC_TPL_SEL_PARAM(context, DT_QUERY, DT_WEIGHT, DT_QROPE, DT_KROPE);

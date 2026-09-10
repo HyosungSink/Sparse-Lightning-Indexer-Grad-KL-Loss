@@ -3,7 +3,7 @@
 struct SparseLightningIndexerGradKlLossTilingData {
     uint32_t batch, queryRows, keyRows, queryHeads, indexHeads;
     uint32_t queryDim, indexDim, ropeDim, sparseSize, empty, statsLayout;
-    uint32_t queryLengthType, keyLengthType, cores, rowWorkers;
+    uint32_t queryLengthType, keyLengthType, cores, rowWorkers, compact;
     float scale;
     uint64_t batchScratch;
 };
