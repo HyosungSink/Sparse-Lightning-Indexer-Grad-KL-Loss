@@ -121,7 +121,7 @@ class SparseGrad {
     LocalTensor<float> mainQuery, mainRope, mainKeys, mainKeyRopes;
     bool cachedMain;
     LocalTensor<float> pairMainScores;
-    bool cachePairMain, pairMainReady, vectorPairMain, vectorPairExp;
+    bool cachePairMain, pairMainReady, vectorPairMain, vectorPairExp, vectorPairGrad;
     LocalTensor<float> pairVectorWork;
     uint32_t stride;
     uint64_t simOffset, massOffset, logitOffset;
@@ -246,6 +246,8 @@ public:
             t.queryHeads*t.ropeDim<=256 && static_cast<uint64_t>(t.keyRows)*t.queryDim<=4096 &&
             static_cast<uint64_t>(t.keyRows)*t.ropeDim<=1024;
         vectorPairExp=vectorPairMain && t.keyRows*t.queryHeads<=1024 && cacheSize<=4096;
+        vectorPairGrad=vectorPairExp && t.indexDim>=8 && t.indexDim<=64 && t.indexDim%8==0 &&
+            t.indexHeads*t.indexDim<=1024;
         pipe.InitBuffer(storage, (2*cacheSize + 512*8 + 128*4 + 64 +
             (cachedMain?6400:0) + pairCacheSize + (vectorPairMain?15616:0) + (vectorPairExp?6144:0))*sizeof(float));
         auto mem = storage.Get<float>();
@@ -432,6 +434,91 @@ public:
         }
         return PairMainRaw(batch,row,head,key);
     }
+    __aicore__ inline void PairVectorAdd(LocalTensor<float> dh,LocalTensor<float> dl,
+        LocalTensor<float> ah,LocalTensor<float> al,LocalTensor<float> bh,LocalTensor<float> bl,uint32_t count) {
+        auto sum=pairVectorWork[12288],v=pairVectorWork[13312],e=pairVectorWork[14336];
+        Add(sum,ah,bh,count); PipeBarrier<PIPE_V>();
+        Sub(v,sum,ah,count); PipeBarrier<PIPE_V>();
+        Sub(e,sum,v,count); PipeBarrier<PIPE_V>();
+        Sub(e,ah,e,count); Sub(v,bh,v,count); PipeBarrier<PIPE_V>();
+        Add(e,e,v,count); PipeBarrier<PIPE_V>();
+        Add(e,e,al,count); PipeBarrier<PIPE_V>();
+        Add(e,e,bl,count); PipeBarrier<PIPE_V>();
+        Add(dh,sum,e,count); PipeBarrier<PIPE_V>();
+        Sub(v,dh,sum,count); PipeBarrier<PIPE_V>();
+        Sub(dl,e,v,count); PipeBarrier<PIPE_V>();
+    }
+    __aicore__ inline void PairGradientProduct(bool queryInput) {
+        auto hi=pairVectorWork[2048],lo=pairVectorWork[3072];
+        auto coefficient=pairVectorWork[6144],coefficientLow=pairVectorWork[7168];
+        auto xh=pairVectorWork[8192],xl=pairVectorWork[9216];
+        auto yh=pairVectorWork[10240],yl=pairVectorWork[11264];
+        auto temp=pairVectorWork[12288],sum=pairVectorWork[13312],v=pairVectorWork[14336];
+        auto input=queryInput?qiCache:keyCache;
+        uint32_t count=t.indexHeads*t.indexDim, inputCount=queryInput?count:t.indexDim;
+        uint8_t span=static_cast<uint8_t>(t.indexDim/8),heads=static_cast<uint8_t>(t.indexHeads);
+        BinaryRepeatParams repeated{1,1,1,span,span,static_cast<uint8_t>(queryInput?span:0)};
+        ShiftRight(xh.ReinterpretCast<uint32_t>(),coefficient.ReinterpretCast<uint32_t>(),12U,count);
+        ShiftRight(yh.ReinterpretCast<uint32_t>(),input.ReinterpretCast<uint32_t>(),12U,inputCount);
+        PipeBarrier<PIPE_V>();
+        ShiftLeft(xh.ReinterpretCast<uint32_t>(),xh.ReinterpretCast<uint32_t>(),12U,count);
+        ShiftLeft(yh.ReinterpretCast<uint32_t>(),yh.ReinterpretCast<uint32_t>(),12U,inputCount);
+        PipeBarrier<PIPE_V>();
+        Sub(xl,coefficient,xh,count); Sub(yl,input,yh,inputCount);
+        Mul(hi,coefficient,input,static_cast<uint64_t>(t.indexDim),heads,repeated);
+        Mul(lo,xh,yh,static_cast<uint64_t>(t.indexDim),heads,repeated); PipeBarrier<PIPE_V>();
+        Sub(lo,lo,hi,count);
+        Mul(temp,xh,yl,static_cast<uint64_t>(t.indexDim),heads,repeated); PipeBarrier<PIPE_V>();
+        Add(lo,lo,temp,count); PipeBarrier<PIPE_V>();
+        Mul(temp,xl,yh,static_cast<uint64_t>(t.indexDim),heads,repeated); PipeBarrier<PIPE_V>();
+        Add(lo,lo,temp,count); PipeBarrier<PIPE_V>();
+        Mul(temp,xl,yl,static_cast<uint64_t>(t.indexDim),heads,repeated); PipeBarrier<PIPE_V>();
+        Add(lo,lo,temp,count); PipeBarrier<PIPE_V>();
+        Mul(temp,coefficientLow,input,static_cast<uint64_t>(t.indexDim),heads,repeated); PipeBarrier<PIPE_V>();
+        Add(lo,lo,temp,count); PipeBarrier<PIPE_V>();
+        Add(sum,hi,lo,count); PipeBarrier<PIPE_V>();
+        Sub(v,sum,hi,count); PipeBarrier<PIPE_V>();
+        Sub(lo,lo,v,count); Adds(hi,sum,0.0f,count); PipeBarrier<PIPE_V>();
+    }
+    __aicore__ inline void PairGradientStep(uint32_t batch,uint32_t key) {
+        uint32_t dim=t.indexDim, count=t.indexHeads*dim;
+        auto qh=pairVectorWork,ql=pairVectorWork[1024];
+        auto ph=pairVectorWork[2048],pl=pairVectorWork[3072];
+        auto kh=pairVectorWork[4096],kl=pairVectorWork[5120];
+        Load(keyCache,ki,(static_cast<uint64_t>(batch)*t.keyRows+key)*dim,dim);
+        PairGradientProduct(false);
+        PairVectorAdd(qh,ql,qh,ql,ph,pl,count);
+        PairGradientProduct(true);
+        Load(pairVectorWork[8192],scratch,2*static_cast<uint64_t>(key)*dim,2*dim);
+        uint64_t selected=0;
+        GatherMask(kh,pairVectorWork[8192],static_cast<uint8_t>(1),true,2*dim,{1,1,8,0},selected);
+        GatherMask(kl,pairVectorWork[8192],static_cast<uint8_t>(2),true,2*dim,{1,1,8,0},selected);
+        PipeBarrier<PIPE_V>();
+        // Preserve the original head order, including repeated sparse indices.
+        for(uint32_t h=0;h<t.indexHeads;++h)
+            PairVectorAdd(kh,kl,kh,kl,ph[h*dim],pl[h*dim],dim);
+        Brcb(pairVectorWork[8192],kh,static_cast<uint8_t>(dim/8),{1,8});
+        Brcb(pairVectorWork[9216],kl,static_cast<uint8_t>(dim/8),{1,8});
+        PipeBarrier<PIPE_ALL>();
+        DataCopyExtParams interleaved{static_cast<uint16_t>(dim),4,0,4,0};
+        DataCopyPad(scratch[2*static_cast<uint64_t>(key)*dim],pairVectorWork[8192],interleaved);
+        DataCopyPad(scratch[2*static_cast<uint64_t>(key)*dim+1],pairVectorWork[9216],interleaved);
+        PipeBarrier<PIPE_ALL>();
+    }
+    __aicore__ inline void FinishPairVector(uint32_t first,uint64_t offset,uint32_t count) {
+        auto hi=pairVectorWork,lo=pairVectorWork[1024];
+        auto ph=pairVectorWork[2048],pl=pairVectorWork[3072],packed=pairVectorWork[4096];
+        Duplicate(hi,0.0f,count); Duplicate(lo,0.0f,count); PipeBarrier<PIPE_V>();
+        for(uint32_t peer=0;peer<t.rowWorkers;++peer) {
+            Load(packed,allScratch,(first+peer)*t.batchScratch+2*offset,2*count);
+            uint64_t selected=0;
+            GatherMask(ph,packed,static_cast<uint8_t>(1),true,2*count,{1,1,8,0},selected);
+            GatherMask(pl,packed,static_cast<uint8_t>(2),true,2*count,{1,1,8,0},selected);
+            PipeBarrier<PIPE_V>();
+            PairVectorAdd(hi,lo,hi,lo,ph,pl,count);
+        }
+        Add(a,hi,lo,count); PipeBarrier<PIPE_V>();
+    }
     template<bool Accurate>
     __aicore__ inline void FinishBatch(uint32_t batch, uint64_t keyCount) {
         uint32_t worker = GetBlockIdx() % t.rowWorkers;
@@ -444,7 +531,8 @@ public:
         for (uint64_t offset = worker * 512; offset < keyCount; offset += t.rowWorkers * 512) {
             uint32_t n = keyCount-offset < 512 ? keyCount-offset : 512;
             if constexpr (Accurate) {
-                for (uint32_t d = 0; d < n; ++d) {
+                if(vectorPairGrad) FinishPairVector(first,offset,n);
+                else for (uint32_t d = 0; d < n; ++d) {
                     SliPair value(0);
                     for (uint32_t peer = 0; peer < t.rowWorkers; ++peer) {
                         uint64_t position = (first+peer)*t.batchScratch + 2*(offset+d);
@@ -484,7 +572,8 @@ public:
             }
             for(uint32_t row=GetBlockIdx()%t.rowWorkers;row<t.queryRows;row+=t.rowWorkers) {
                 uint64_t token=static_cast<uint64_t>(batch)*t.queryRows+row;
-                for(uint32_t d=0;d<t.indexHeads*t.indexDim;++d) PutPair(qOffset+2*d,SliPair(0));
+                if(!vectorPairGrad)
+                    for(uint32_t d=0;d<t.indexHeads*t.indexDim;++d) PutPair(qOffset+2*d,SliPair(0));
                 Duplicate(weightOut,0.0f,64); PipeBarrier<PIPE_ALL>();
                 if(row<qlen) {
                     SliPair headNorm[128], headScore[128], headDenom[128], gradW[64];
@@ -564,6 +653,12 @@ public:
                         PutPair(iOffset+2*j,logit);
                         if(logit>maxLogit) maxLogit=logit;
                     }
+                    if(vectorPairGrad) {
+                        LoadMatrix(qiCache,qi,token*t.indexHeads*t.indexDim,t.indexHeads*t.indexDim);
+                        Duplicate(pairVectorWork,0.0f,t.indexHeads*t.indexDim);
+                        Duplicate(pairVectorWork[1024],0.0f,t.indexHeads*t.indexDim);
+                        PipeBarrier<PIPE_ALL>();
+                    }
                     if(validCount) {
                         SliPair mt(0),ip(0);
                         for(uint32_t j=0;j<t.sparseSize;++j) {
@@ -581,6 +676,16 @@ public:
                             total=total+target*((tm-logmt)-(im-logip));
                             for(uint32_t h=0;h<t.indexHeads;++h) {
                                 SliPair similarity=PairAt(sOffset+2*(static_cast<uint64_t>(j)*t.indexHeads+h));
+                                if(vectorPairGrad) {
+                                    SliPair ds(0);
+                                    if(similarity>SliPair(0)) {
+                                        gradW[h]=gradW[h]+di*similarity;
+                                        ds=di*SliPair(static_cast<float>(w.GetValue(token*t.indexHeads+h)));
+                                    }
+                                    Duplicate(pairVectorWork[6144+h*t.indexDim],ds.hi,t.indexDim);
+                                    Duplicate(pairVectorWork[7168+h*t.indexDim],ds.lo,t.indexDim);
+                                    continue;
+                                }
                                 if(!(similarity>SliPair(0))) continue;
                                 gradW[h]=gradW[h]+di*similarity;
                                 SliPair ds=di*SliPair(static_cast<float>(w.GetValue(token*t.indexHeads+h)));
@@ -593,11 +698,21 @@ public:
                                         (token*t.indexHeads+h)*t.indexDim+d))));
                                 }
                             }
+                            if(vectorPairGrad) {
+                                PipeBarrier<PIPE_ALL>();
+                                PairGradientStep(batch,static_cast<uint32_t>(key));
+                            }
                         }
                         for(uint32_t h=0;h<t.indexHeads;++h) weightOut.SetValue(h,gradW[h].Value());
                     }
                 }
-                for(uint32_t h=0;h<t.indexHeads;++h) {
+                if(vectorPairGrad) {
+                    uint32_t count=t.indexHeads*t.indexDim;
+                    if(row<qlen) Add(dqCache,pairVectorWork,pairVectorWork[1024],count);
+                    else Duplicate(dqCache,0.0f,count);
+                    PipeBarrier<PIPE_V>();
+                    Store(dq,token*count,dqCache,count);
+                } else for(uint32_t h=0;h<t.indexHeads;++h) {
                     for(uint32_t d=0;d<t.indexDim;++d) a.SetValue(d,PairAt(qOffset+2*(h*t.indexDim+d)).Value());
                     Store(dq,(token*t.indexHeads+h)*t.indexDim,a,t.indexDim);
                 }
