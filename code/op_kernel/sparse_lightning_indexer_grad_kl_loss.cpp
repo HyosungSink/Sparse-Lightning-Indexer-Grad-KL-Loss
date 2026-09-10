@@ -251,7 +251,7 @@ public:
         vectorPairIndex=vectorPairGrad && (t.indexDim&(t.indexDim-1))==0;
         tiledPairMain=vectorPairGrad && t.queryHeads<=64;
         pipe.InitBuffer(storage, (2*cacheSize + 512*8 + 128*4 + 64 +
-            (cachedMain?6400:0) + pairCacheSize + (vectorPairMain?15616:0) + (vectorPairExp?6144:0) + (tiledPairMain?7168:0))*sizeof(float));
+            (cachedMain?6400:0) + pairCacheSize + (vectorPairMain?15616:0) + (vectorPairExp?6144:0) + (tiledPairMain?17408:0))*sizeof(float));
         auto mem = storage.Get<float>();
         a = mem; b = mem[512]; product = mem[1024]; temporary = mem[1536]; result = mem[2048];
         raw = mem[2560].ReinterpretCast<uint8_t>();
@@ -407,31 +407,28 @@ public:
         PipeBarrier<PIPE_ALL>();
     }
     __aicore__ inline void PairVectorDotsTiled(LocalTensor<float> query,LocalTensor<float> key,uint32_t dim,uint32_t headCount) {
-        auto hi=pairVectorWork,lo=pairVectorWork[2048];
-        auto xh=pairVectorWork[4096],yh=pairVectorWork[6144];
-        auto xl=pairVectorWork[8192],yl=pairVectorWork[10240];
-        auto sum=pairVectorWork[12288],v=pairVectorWork[14336],e=pairVectorWork[16384];
+        auto hi=pairVectorWork,lo=pairVectorWork[4096];
+        auto xh=pairVectorWork[8192],yh=pairVectorWork[12288];
+        auto xl=query,yl=key;
+        auto v=pairVectorWork[24576],e=pairVectorWork[28672];
         uint32_t count=headCount*dim;
-        uint8_t span=static_cast<uint8_t>(dim/8),heads=static_cast<uint8_t>(headCount);
-        BinaryRepeatParams repeated{1,1,1,span,span,span};
+        Mul(hi,query,key,count);
         ShiftRight(xh.ReinterpretCast<uint32_t>(),query.ReinterpretCast<uint32_t>(),12U,count);
         ShiftRight(yh.ReinterpretCast<uint32_t>(),key.ReinterpretCast<uint32_t>(),12U,count);
         PipeBarrier<PIPE_V>();
         ShiftLeft(xh.ReinterpretCast<uint32_t>(),xh.ReinterpretCast<uint32_t>(),12U,count);
         ShiftLeft(yh.ReinterpretCast<uint32_t>(),yh.ReinterpretCast<uint32_t>(),12U,count);
         PipeBarrier<PIPE_V>();
+        // The expanded inputs are dead after their product, so reuse them for
+        // low mantissas and later reduction operands.
         Sub(xl,query,xh,count); Sub(yl,key,yh,count);
-        Mul(hi,query,key,static_cast<uint64_t>(dim),heads,repeated);
-        Mul(lo,xh,yh,static_cast<uint64_t>(dim),heads,repeated);
-        PipeBarrier<PIPE_V>();
-        Sub(lo,lo,hi,count);
-        Mul(sum,xh,yl,static_cast<uint64_t>(dim),heads,repeated); PipeBarrier<PIPE_V>();
-        Add(lo,lo,sum,count); PipeBarrier<PIPE_V>();
-        Mul(sum,xl,yh,static_cast<uint64_t>(dim),heads,repeated); PipeBarrier<PIPE_V>();
-        Add(lo,lo,sum,count); PipeBarrier<PIPE_V>();
-        Mul(sum,xl,yl,static_cast<uint64_t>(dim),heads,repeated); PipeBarrier<PIPE_V>();
-        Add(lo,lo,sum,count); PipeBarrier<PIPE_V>();
-        // Error-free pairwise summation; packed even/odd lanes stay within each head.
+        Mul(lo,xh,yh,count); PipeBarrier<PIPE_V>();
+        Sub(lo,lo,hi,count); Mul(e,xh,yl,count); PipeBarrier<PIPE_V>();
+        Add(lo,lo,e,count); PipeBarrier<PIPE_V>();
+        Mul(e,xl,yh,count); PipeBarrier<PIPE_V>();
+        Add(lo,lo,e,count); PipeBarrier<PIPE_V>();
+        Mul(e,xl,yl,count); PipeBarrier<PIPE_V>();
+        Add(lo,lo,e,count); PipeBarrier<PIPE_V>();
         for(uint32_t width=dim;width>1;width/=2) {
             uint64_t selected=0;
             GatherMask(xh,hi,static_cast<uint8_t>(1),true,count,{1,1,8,0},selected);
@@ -439,22 +436,22 @@ public:
             GatherMask(xl,lo,static_cast<uint8_t>(1),true,count,{1,1,8,0},selected);
             GatherMask(yl,lo,static_cast<uint8_t>(2),true,count,{1,1,8,0},selected);
             count/=2; PipeBarrier<PIPE_V>();
-            Add(sum,xh,yh,count); PipeBarrier<PIPE_V>();
-            Sub(v,sum,xh,count); PipeBarrier<PIPE_V>();
-            Sub(e,sum,v,count); PipeBarrier<PIPE_V>();
+            Add(hi,xh,yh,count); PipeBarrier<PIPE_V>();
+            Sub(v,hi,xh,count); PipeBarrier<PIPE_V>();
+            Sub(e,hi,v,count); PipeBarrier<PIPE_V>();
             Sub(e,xh,e,count); Sub(v,yh,v,count); PipeBarrier<PIPE_V>();
             Add(e,e,v,count); PipeBarrier<PIPE_V>();
             Add(e,e,xl,count); PipeBarrier<PIPE_V>();
             Add(e,e,yl,count); PipeBarrier<PIPE_V>();
-            Add(hi,sum,e,count); PipeBarrier<PIPE_V>();
-            Sub(v,hi,sum,count); PipeBarrier<PIPE_V>();
-            Sub(lo,e,v,count); PipeBarrier<PIPE_V>();
+            Add(yh,hi,e,count); PipeBarrier<PIPE_V>();
+            Sub(v,yh,hi,count); PipeBarrier<PIPE_V>();
+            Sub(lo,e,v,count); Adds(hi,yh,0.0f,count); PipeBarrier<PIPE_V>();
         }
         PipeBarrier<PIPE_ALL>();
     }
     __aicore__ inline void ExpandPairMain(LocalTensor<float> query,LocalTensor<float> keys,
         uint32_t first,uint32_t keyCount,uint32_t dim) {
-        auto queryTile=pairVectorWork[18432],keyTile=pairVectorWork[20480];
+        auto queryTile=pairVectorWork[16384],keyTile=pairVectorWork[20480];
         uint32_t count=t.queryHeads*dim;
         uint8_t span=static_cast<uint8_t>(dim/8);
         for(uint32_t i=0;i<keyCount;++i) {
@@ -465,28 +462,55 @@ public:
         PipeBarrier<PIPE_ALL>();
         PairVectorDotsTiled(queryTile,keyTile,dim,t.queryHeads*keyCount);
     }
+    __aicore__ inline void PairMainScale(uint32_t count) {
+        auto hi=pairVectorWork,lo=pairVectorWork[4096];
+        union {float f;uint32_t u;} scale;
+        scale.f=t.scale;
+        if((scale.u&0x7fffffU)==0) {
+            Muls(hi,hi,t.scale,count); Muls(lo,lo,t.scale,count);
+            PipeBarrier<PIPE_ALL>(); return;
+        }
+        auto xh=pairVectorWork[8192],xl=pairVectorWork[9216];
+        auto p=pairVectorWork[10240],e=pairVectorWork[11264];
+        auto temp=pairVectorWork[12288],sum=pairVectorWork[13312],v=pairVectorWork[14336];
+        scale.u&=0xfffff000U;
+        float sh=scale.f,sl=t.scale-sh;
+        ShiftRight(xh.ReinterpretCast<uint32_t>(),hi.ReinterpretCast<uint32_t>(),12U,count); PipeBarrier<PIPE_V>();
+        ShiftLeft(xh.ReinterpretCast<uint32_t>(),xh.ReinterpretCast<uint32_t>(),12U,count); PipeBarrier<PIPE_V>();
+        Sub(xl,hi,xh,count); Muls(p,hi,t.scale,count); Muls(e,xh,sh,count); PipeBarrier<PIPE_V>();
+        Sub(e,e,p,count); Muls(temp,xh,sl,count); PipeBarrier<PIPE_V>();
+        Add(e,e,temp,count); PipeBarrier<PIPE_V>();
+        Muls(temp,xl,sh,count); PipeBarrier<PIPE_V>();
+        Add(e,e,temp,count); PipeBarrier<PIPE_V>();
+        Muls(temp,xl,sl,count); PipeBarrier<PIPE_V>();
+        Add(e,e,temp,count); PipeBarrier<PIPE_V>();
+        Muls(temp,lo,t.scale,count); PipeBarrier<PIPE_V>();
+        Add(e,e,temp,count); PipeBarrier<PIPE_V>();
+        Add(sum,p,e,count); PipeBarrier<PIPE_V>();
+        Sub(v,sum,p,count); PipeBarrier<PIPE_V>();
+        Sub(lo,e,v,count); Adds(hi,sum,0.0f,count); PipeBarrier<PIPE_ALL>();
+    }
     __aicore__ inline void PreparePairMainTiled(uint32_t batch,uint32_t row,int64_t visible) {
         uint64_t token=static_cast<uint64_t>(batch)*t.queryRows+row;
         LoadMatrix(mainQuery,q,token*t.queryHeads*t.queryDim,t.queryHeads*t.queryDim);
         LoadMatrix(mainRope,qr,token*t.queryHeads*t.ropeDim,t.queryHeads*t.ropeDim);
         uint32_t dim=t.queryDim>t.ropeDim?t.queryDim:t.ropeDim;
-        uint32_t tile=2048/(t.queryHeads*dim);
+        uint32_t tile=4096/(t.queryHeads*dim);
         if(tile>128/t.queryHeads) tile=128/t.queryHeads;
         for(int64_t key=0;key<visible;key+=tile) {
             uint32_t count=visible-key<tile?visible-key:tile;
             ExpandPairMain(mainQuery,mainKeys,static_cast<uint32_t>(key),count,t.queryDim);
+            uint32_t values=count*t.queryHeads,copyCount=(values+7)/8*8;
+            DataCopy(a,pairVectorWork,copyCount); DataCopy(b,pairVectorWork[4096],copyCount);
+            PipeBarrier<PIPE_V>();
+            ExpandPairMain(mainRope,mainKeyRopes,static_cast<uint32_t>(key),count,t.ropeDim);
+            PairVectorAdd(pairVectorWork,pairVectorWork[4096],a,b,
+                pairVectorWork,pairVectorWork[4096],values);
+            PairMainScale(values);
             for(uint32_t i=0;i<count;++i) for(uint32_t h=0;h<t.queryHeads;++h) {
                 uint32_t source=i*t.queryHeads+h,offset=2*(h*t.keyRows+key+i);
                 pairMainScores.SetValue(offset,pairVectorWork.GetValue(source));
-                pairMainScores.SetValue(offset+1,pairVectorWork.GetValue(2048+source));
-            }
-            ExpandPairMain(mainRope,mainKeyRopes,static_cast<uint32_t>(key),count,t.ropeDim);
-            for(uint32_t i=0;i<count;++i) for(uint32_t h=0;h<t.queryHeads;++h) {
-                uint32_t source=i*t.queryHeads+h,offset=2*(h*t.keyRows+key+i);
-                SliPair raw(pairMainScores.GetValue(offset),pairMainScores.GetValue(offset+1));
-                SliPair rope(pairVectorWork.GetValue(source),pairVectorWork.GetValue(2048+source));
-                SliPair score=(raw+rope)*SliPair(t.scale);
-                pairMainScores.SetValue(offset,score.hi); pairMainScores.SetValue(offset+1,score.lo);
+                pairMainScores.SetValue(offset+1,pairVectorWork.GetValue(4096+source));
             }
         }
     }
