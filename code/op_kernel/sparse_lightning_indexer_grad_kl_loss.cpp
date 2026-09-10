@@ -112,7 +112,7 @@ class SparseGrad {
     GlobalTensor<KR> kr;
     GlobalTensor<int32_t> indices, ql32, kl32;
     GlobalTensor<int64_t> ql64, kl64;
-    GlobalTensor<float> maxima, sums, scratch, losses, loss;
+    GlobalTensor<float> maxima, sums, scratch, allScratch, losses, loss;
     SparseLightningIndexerGradKlLossTilingData t;
     TPipe pipe;
     TBuf<TPosition::VECCALC> storage;
@@ -193,6 +193,7 @@ public:
         dq.SetGlobalBuffer((__gm__ T*)dQuery); dk.SetGlobalBuffer((__gm__ T*)dKey);
         dw.SetGlobalBuffer((__gm__ W*)dWeight); loss.SetGlobalBuffer((__gm__ float*)outputLoss);
         scratch.SetGlobalBuffer((__gm__ float*)workspace + GetBlockIdx()*t.batchScratch);
+        allScratch.SetGlobalBuffer((__gm__ float*)workspace);
         losses.SetGlobalBuffer((__gm__ float*)workspace + t.cores*t.batchScratch);
         stride = (t.indexDim + 7)/8*8;
         uint32_t cacheSize = t.indexHeads*stride;
@@ -228,6 +229,37 @@ public:
         return (PairDot(q,qo*t.queryDim,k,ko*t.queryDim,t.queryDim)+
                 PairDot(qr,qo*t.ropeDim,kr,ko*t.ropeDim,t.ropeDim))*SliPair(t.scale);
     }
+    template<bool Accurate>
+    __aicore__ inline void FinishBatch(uint32_t batch, uint64_t keyCount) {
+        uint32_t worker = GetBlockIdx() % t.rowWorkers;
+        uint32_t first = GetBlockIdx() - worker;
+        if (t.rowWorkers > 1) {
+            DataCacheCleanAndInvalid<float,CacheLine::ENTIRE_DATA_CACHE>(scratch);
+            SyncAll();
+        }
+        // Workers own disjoint output ranges and reduce partials in a fixed order.
+        for (uint64_t offset = worker * 512; offset < keyCount; offset += t.rowWorkers * 512) {
+            uint32_t n = keyCount-offset < 512 ? keyCount-offset : 512;
+            if constexpr (Accurate) {
+                for (uint32_t d = 0; d < n; ++d) {
+                    SliPair value(0);
+                    for (uint32_t peer = 0; peer < t.rowWorkers; ++peer) {
+                        uint64_t position = (first+peer)*t.batchScratch + 2*(offset+d);
+                        value = value + SliPair(allScratch.GetValue(position),allScratch.GetValue(position+1));
+                    }
+                    a.SetValue(d,value.Value());
+                }
+            } else {
+                Load(a,allScratch,first*t.batchScratch+offset,n);
+                for (uint32_t peer = 1; peer < t.rowWorkers; ++peer) {
+                    Load(b,allScratch,(first+peer)*t.batchScratch+offset,n);
+                    Add(a,a,b,n);
+                    PipeBarrier<PIPE_V>();
+                }
+            }
+            Store(dk,static_cast<uint64_t>(batch)*keyCount+offset,a,n);
+        }
+    }
     __aicore__ inline void ProcessAccurate() {
         uint64_t keyCount=static_cast<uint64_t>(t.keyRows)*t.indexDim;
         uint64_t qOffset=(2*keyCount+15)/16*16;
@@ -235,7 +267,7 @@ public:
         uint64_t mOffset=sOffset+2*static_cast<uint64_t>(t.sparseSize)*t.indexHeads;
         uint64_t iOffset=mOffset+2*t.sparseSize;
         SliPair total(0);
-        for(uint32_t batch=GetBlockIdx();batch<t.batch;batch+=t.cores) {
+        for(uint32_t batch=GetBlockIdx()/t.rowWorkers;batch<t.batch;batch+=t.cores/t.rowWorkers) {
             DataCacheCleanAndInvalid<float,CacheLine::ENTIRE_DATA_CACHE>(scratch);
             Duplicate(a,0.0f,512);
             for(uint64_t offset=0;offset<2*keyCount;offset+=512) {
@@ -243,7 +275,7 @@ public:
                 Store(scratch,offset,a,n);
             }
             uint32_t qlen=t.empty?0:Length(true,batch),klen=Length(false,batch);
-            for(uint32_t row=0;row<t.queryRows;++row) {
+            for(uint32_t row=GetBlockIdx()%t.rowWorkers;row<t.queryRows;row+=t.rowWorkers) {
                 uint64_t token=static_cast<uint64_t>(batch)*t.queryRows+row;
                 for(uint32_t d=0;d<t.indexHeads*t.indexDim;++d) PutPair(qOffset+2*d,SliPair(0));
                 Duplicate(weightOut,0.0f,64); PipeBarrier<PIPE_ALL>();
@@ -326,11 +358,7 @@ public:
                 }
                 Store(dw,token*t.indexHeads,weightOut,t.indexHeads);
             }
-            for(uint64_t offset=0;offset<keyCount;offset+=512) {
-                uint32_t n=keyCount-offset<512?keyCount-offset:512;
-                for(uint32_t d=0;d<n;++d) a.SetValue(d,PairAt(2*(offset+d)).Value());
-                Store(dk,static_cast<uint64_t>(batch)*keyCount+offset,a,n);
-            }
+            FinishBatch<true>(batch,keyCount);
         }
         losses.SetValue(GetBlockIdx()*16,total.hi); losses.SetValue(GetBlockIdx()*16+1,total.lo);
         DataCacheCleanAndInvalid<float,CacheLine::ENTIRE_DATA_CACHE>(losses);
@@ -345,7 +373,7 @@ public:
     __aicore__ inline void Process() {
         if constexpr (AscendC::IsSameType<T,float>::value) { ProcessAccurate(); return; }
         float totalLoss = 0, lossCorrection = 0;
-        for (uint32_t batch = GetBlockIdx(); batch < t.batch; batch += t.cores) {
+        for (uint32_t batch = GetBlockIdx()/t.rowWorkers; batch < t.batch; batch += t.cores/t.rowWorkers) {
             uint64_t keyCount = static_cast<uint64_t>(t.keyRows)*t.indexDim;
             Duplicate(a, 0.0f, 512);
             for (uint64_t offset = 0; offset < keyCount; offset += 512) {
@@ -353,7 +381,7 @@ public:
                 Store(scratch, offset, a, n);
             }
             uint32_t qlen = t.empty ? 0 : Length(true,batch), klen = Length(false,batch);
-            for (uint32_t row = 0; row < t.queryRows; ++row) {
+            for (uint32_t row = GetBlockIdx()%t.rowWorkers; row < t.queryRows; row += t.rowWorkers) {
                 Duplicate(dqCache, 0.0f, t.indexHeads*stride);
                 Duplicate(weightOut, 0.0f, 64);
                 PipeBarrier<PIPE_ALL>();
@@ -451,11 +479,7 @@ public:
                     Store(dq,(token*t.indexHeads+h)*t.indexDim,dqCache[h*stride],t.indexDim);
                 Store(dw,token*t.indexHeads,weightOut,t.indexHeads);
             }
-            for(uint64_t offset=0;offset<keyCount;offset+=512) {
-                uint32_t n=keyCount-offset<512?keyCount-offset:512;
-                Load(a,scratch,offset,n);
-                Store(dk,static_cast<uint64_t>(batch)*keyCount+offset,a,n);
-            }
+            FinishBatch<false>(batch,keyCount);
         }
         losses.SetValue(GetBlockIdx()*16,totalLoss);
         DataCacheCleanAndInvalid<float,CacheLine::ENTIRE_DATA_CACHE>(losses);

@@ -88,7 +88,9 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
         !std::isfinite(*attrs->GetFloat(0))) return ge::GRAPH_FAILED;
     t.scale = *attrs->GetFloat(0);
     auto platform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
-    t.cores = std::max(1U, std::min(t.batch, static_cast<uint32_t>(platform.GetCoreNumAiv())));
+    uint32_t available = std::max(1U, static_cast<uint32_t>(platform.GetCoreNumAiv()));
+    t.rowWorkers = std::max(1U, std::min(t.queryRows, available / t.batch));
+    t.cores = std::min(t.batch, available) * t.rowWorkers;
     // Each worker owns a padded scratch region, including the FP32 scatter accumulator.
     uint64_t scratch = static_cast<uint64_t>(t.keyRows) * t.indexDim +
                        static_cast<uint64_t>(t.sparseSize) * (t.indexHeads + 4) + 16;
