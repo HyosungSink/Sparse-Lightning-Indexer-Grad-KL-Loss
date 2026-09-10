@@ -91,6 +91,20 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
     uint32_t available = std::max(1U, static_cast<uint32_t>(platform.GetCoreNumAiv()));
     t.rowWorkers = std::max(1U, std::min(t.queryRows, available / t.batch));
     t.cores = std::min(t.batch, available) * t.rowWorkers;
+    t.mainWorkers=1;
+    bool parallelMain=core==ge::DT_FLOAT && !t.empty && t.queryRows>0 && t.rowWorkers==t.queryRows &&
+        t.queryDim>=8 && t.queryDim<=64 && (t.queryDim&(t.queryDim-1))==0 &&
+        t.ropeDim>=8 && t.ropeDim<=64 && (t.ropeDim&(t.ropeDim-1))==0 &&
+        t.indexDim>=8 && t.indexDim<=64 && t.indexDim%8==0 && t.queryHeads<=64 &&
+        t.queryHeads*t.queryDim<=1024 && t.queryHeads*t.ropeDim<=256 &&
+        t.indexHeads*t.indexDim<=1024 && static_cast<uint64_t>(t.keyRows)*t.queryDim<=4096 &&
+        static_cast<uint64_t>(t.keyRows)*t.ropeDim<=1024 && t.keyRows*t.queryHeads<=1024 &&
+        t.sparseSize<=256 && static_cast<uint64_t>(t.keyRows)*t.queryHeads*t.queryDim>4096;
+    if(parallelMain) {
+        while(t.mainWorkers*2<=t.queryHeads && t.queryHeads%(t.mainWorkers*2)==0 &&
+            static_cast<uint64_t>(t.cores)*t.mainWorkers*2<=available) t.mainWorkers*=2;
+        t.cores*=t.mainWorkers;
+    }
     uint64_t tokens = static_cast<uint64_t>(t.batch) * t.queryRows;
     uint64_t keys = static_cast<uint64_t>(t.batch) * t.keyRows;
     t.compact = core == ge::DT_FLOAT16 && !t.empty && tokens <= 8 &&

@@ -121,6 +121,7 @@ class SparseGrad {
     LocalTensor<float> mainQuery, mainRope, mainKeys, mainKeyRopes;
     bool cachedMain;
     LocalTensor<float> pairMainScores;
+    uint32_t fullQueryHeads,mainHeadBase;
     bool cachePairMain, pairMainReady, vectorPairMain, vectorPairExp, vectorPairGrad, vectorPairIndex, tiledPairMain;
     LocalTensor<float> pairVectorWork;
     uint32_t stride;
@@ -227,6 +228,7 @@ public:
         dq.SetGlobalBuffer((__gm__ T*)dQuery); dk.SetGlobalBuffer((__gm__ T*)dKey);
         dw.SetGlobalBuffer((__gm__ W*)dWeight); loss.SetGlobalBuffer((__gm__ float*)outputLoss);
         scratch.SetGlobalBuffer((__gm__ float*)workspace + GetBlockIdx()*t.batchScratch);
+        fullQueryHeads=t.queryHeads; mainHeadBase=0;
         allScratch.SetGlobalBuffer((__gm__ float*)workspace);
         losses.SetGlobalBuffer((__gm__ float*)workspace + t.cores*t.batchScratch);
         stride = (t.indexDim + 7)/8*8;
@@ -492,8 +494,8 @@ public:
     }
     __aicore__ inline void PreparePairMainTiled(uint32_t batch,uint32_t row,int64_t visible) {
         uint64_t token=static_cast<uint64_t>(batch)*t.queryRows+row;
-        LoadMatrix(mainQuery,q,token*t.queryHeads*t.queryDim,t.queryHeads*t.queryDim);
-        LoadMatrix(mainRope,qr,token*t.queryHeads*t.ropeDim,t.queryHeads*t.ropeDim);
+        LoadMatrix(mainQuery,q,(token*fullQueryHeads+mainHeadBase)*t.queryDim,t.queryHeads*t.queryDim);
+        LoadMatrix(mainRope,qr,(token*fullQueryHeads+mainHeadBase)*t.ropeDim,t.queryHeads*t.ropeDim);
         uint32_t dim=t.queryDim>t.ropeDim?t.queryDim:t.ropeDim;
         uint32_t tile=4096/(t.queryHeads*dim);
         if(tile>128/t.queryHeads) tile=128/t.queryHeads;
@@ -629,7 +631,7 @@ public:
             PipeBarrier<PIPE_ALL>();
             DataCopyPad(packed,allScratch[first*t.batchScratch+2*offset],
                 DataCopyExtParams{static_cast<uint16_t>(t.rowWorkers),count*8,
-                    static_cast<uint32_t>((t.batchScratch-2*count)*4),0,0},
+                    static_cast<uint32_t>((t.mainWorkers*t.batchScratch-2*count)*4),0,0},
                 DataCopyPadExtParams<float>{false,0,0,0});
             PipeBarrier<PIPE_ALL>();
             uint64_t selected=0;
@@ -648,7 +650,7 @@ public:
         auto ph=pairVectorWork[2048],pl=pairVectorWork[3072],packed=pairVectorWork[4096];
         Duplicate(hi,0.0f,count); Duplicate(lo,0.0f,count); PipeBarrier<PIPE_V>();
         for(uint32_t peer=0;peer<t.rowWorkers;++peer) {
-            Load(packed,allScratch,(first+peer)*t.batchScratch+2*offset,2*count);
+            Load(packed,allScratch,(first+peer*t.mainWorkers)*t.batchScratch+2*offset,2*count);
             uint64_t selected=0;
             GatherMask(ph,packed,static_cast<uint8_t>(1),true,2*count,{1,1,8,0},selected);
             GatherMask(pl,packed,static_cast<uint8_t>(2),true,2*count,{1,1,8,0},selected);
@@ -659,21 +661,22 @@ public:
     }
     template<bool Accurate>
     __aicore__ inline void FinishBatch(uint32_t batch, uint64_t keyCount) {
-        uint32_t worker = GetBlockIdx() % t.rowWorkers;
+        uint32_t groupCores=t.rowWorkers*t.mainWorkers;
+        uint32_t worker = GetBlockIdx() % groupCores;
         uint32_t first = GetBlockIdx() - worker;
-        if (t.rowWorkers > 1) {
+        if (groupCores > 1) {
             DataCacheCleanAndInvalid<float,CacheLine::ENTIRE_DATA_CACHE>(scratch);
             SyncAll();
         }
         // Workers own disjoint output ranges and reduce partials in a fixed order.
-        for (uint64_t offset = worker * 512; offset < keyCount; offset += t.rowWorkers * 512) {
+        for (uint64_t offset = worker * 512; offset < keyCount; offset += groupCores * 512) {
             uint32_t n = keyCount-offset < 512 ? keyCount-offset : 512;
             if constexpr (Accurate) {
                 if(vectorPairGrad) FinishPairVector(first,offset,n);
                 else for (uint32_t d = 0; d < n; ++d) {
                     SliPair value(0);
                     for (uint32_t peer = 0; peer < t.rowWorkers; ++peer) {
-                        uint64_t position = (first+peer)*t.batchScratch + 2*(offset+d);
+                        uint64_t position = (first+peer*t.mainWorkers)*t.batchScratch + 2*(offset+d);
                         value = value + SliPair(allScratch.GetValue(position),allScratch.GetValue(position+1));
                     }
                     a.SetValue(d,value.Value());
@@ -681,13 +684,95 @@ public:
             } else {
                 Load(a,allScratch,first*t.batchScratch+offset,n);
                 for (uint32_t peer = 1; peer < t.rowWorkers; ++peer) {
-                    Load(b,allScratch,(first+peer)*t.batchScratch+offset,n);
+                    Load(b,allScratch,(first+peer*t.mainWorkers)*t.batchScratch+offset,n);
                     Add(a,a,b,n);
                     PipeBarrier<PIPE_V>();
                 }
             }
             Store(dk,static_cast<uint64_t>(batch)*keyCount+offset,a,n);
         }
+    }
+    __aicore__ inline SliPair PeerPair(uint32_t peer,uint64_t offset) {
+        uint64_t position=static_cast<uint64_t>(peer)*t.batchScratch+offset;
+        return SliPair(allScratch.GetValue(position),allScratch.GetValue(position+1));
+    }
+    __aicore__ inline void PrepareParallelTargets() {
+        uint32_t logical=GetBlockIdx()/t.mainWorkers;
+        uint32_t batch=logical/t.rowWorkers,row=logical%t.rowWorkers;
+        uint32_t qlen=Length(true,batch),klen=Length(false,batch);
+        int64_t visible=static_cast<int64_t>(row)+klen-qlen+1;
+        uint64_t keyCount=static_cast<uint64_t>(t.keyRows)*t.indexDim;
+        uint64_t qOffset=(2*keyCount+15)/16*16;
+        uint64_t sOffset=qOffset+2*t.indexHeads*t.indexDim;
+        uint64_t mOffset=sOffset+2*static_cast<uint64_t>(t.sparseSize)*t.indexHeads;
+        uint64_t iOffset=mOffset+2*t.sparseSize;
+        t.queryHeads=fullQueryHeads/t.mainWorkers;
+        mainHeadBase=(GetBlockIdx()%t.mainWorkers)*t.queryHeads;
+        if(row<qlen && visible>0) {
+            LoadMatrix(mainKeys,k,static_cast<uint64_t>(batch)*t.keyRows*t.queryDim,t.keyRows*t.queryDim);
+            LoadMatrix(mainKeyRopes,kr,static_cast<uint64_t>(batch)*t.keyRows*t.ropeDim,t.keyRows*t.ropeDim);
+            PreparePairMainTiled(batch,row,visible);
+            pairMainReady=true;
+            SliPair maxima[128],inverse[128];
+            bool logReady=false;
+            for(uint32_t h=0;h<t.queryHeads;++h) {
+                SliPair mx(-3.4e38f);
+                for(int64_t key=0;key<visible;++key) {
+                    SliPair score=PairMain(batch,row,h,key);
+                    if(score>mx) mx=score;
+                }
+                maxima[h]=mx;
+                for(int64_t key=0;key<visible;++key)
+                    PairExpInput(h*visible+key,PairMain(batch,row,h,key)-mx);
+            }
+            PairExpBatch(t.queryHeads*visible);
+            for(uint32_t h=0;h<t.queryHeads;++h) {
+                SliPair sm(0);
+                for(int64_t key=0;key<visible;++key) sm=sm+PairExpAt(h*visible+key);
+                inverse[h]=SliPair(1)/sm;
+            }
+            uint64_t token=static_cast<uint64_t>(batch)*t.queryRows+row;
+            for(uint32_t j=0;j<t.sparseSize;++j) {
+                int32_t key=indices.GetValue(token*t.sparseSize+j);
+                if(!Valid(key,row,qlen,klen)) continue;
+                SliPair mass(0),logmass(0);
+                for(uint32_t h=0;h<t.queryHeads;++h) mass=mass+PairExpAt(h*visible+key)*inverse[h];
+                if(mass.hi<=1e-20f) {
+                    if(!logReady) {
+                        for(uint32_t h=0;h<t.queryHeads;++h) maxima[h]=maxima[h]-SliPairLog(inverse[h]);
+                        logReady=true;
+                    }
+                    SliPair mx(-3.4e38f),sum(0);
+                    for(uint32_t h=0;h<t.queryHeads;++h) {
+                        SliPair value=PairMain(batch,row,h,key)-maxima[h];
+                        if(value>mx) mx=value;
+                    }
+                    for(uint32_t h=0;h<t.queryHeads;++h)
+                        sum=sum+SliPairExp(PairMain(batch,row,h,key)-maxima[h]-mx);
+                    logmass=mx+SliPairLog(sum);
+                }
+                PutPair(iOffset+2*j,mass); PutPair(mOffset+2*j,logmass);
+            }
+        }
+        DataCacheCleanAndInvalid<float,CacheLine::ENTIRE_DATA_CACHE>(scratch);
+        SyncAll();
+        t.queryHeads=fullQueryHeads;
+        mainHeadBase=0;
+    }
+    __aicore__ inline void MergeParallelMass(uint32_t j,uint64_t mOffset,uint64_t iOffset,
+        SliPair &mass,SliPair &logmass) {
+        uint32_t first=GetBlockIdx();
+        mass=SliPair(0); logmass=SliPair(0);
+        for(uint32_t peer=0;peer<t.mainWorkers;++peer) mass=mass+PeerPair(first+peer,iOffset+2*j);
+        if(mass.hi>1e-20f) return;
+        SliPair mx(-3.4e38f),sum(0);
+        for(uint32_t peer=0;peer<t.mainWorkers;++peer) {
+            SliPair value=PeerPair(first+peer,mOffset+2*j);
+            if(value>mx) mx=value;
+        }
+        for(uint32_t peer=0;peer<t.mainWorkers;++peer)
+            sum=sum+SliPairExp(PeerPair(first+peer,mOffset+2*j)-mx);
+        logmass=mx+SliPairLog(sum);
     }
     __aicore__ inline void ProcessAccurate() {
         uint64_t keyCount=static_cast<uint64_t>(t.keyRows)*t.indexDim;
@@ -696,7 +781,10 @@ public:
         uint64_t mOffset=sOffset+2*static_cast<uint64_t>(t.sparseSize)*t.indexHeads;
         uint64_t iOffset=mOffset+2*t.sparseSize;
         SliPair total(0);
-        for(uint32_t batch=GetBlockIdx()/t.rowWorkers;batch<t.batch;batch+=t.cores/t.rowWorkers) {
+        if(t.mainWorkers>1) PrepareParallelTargets();
+        uint32_t logical=GetBlockIdx()/t.mainWorkers;
+        bool leader=GetBlockIdx()%t.mainWorkers==0;
+        for(uint32_t batch=logical/t.rowWorkers;batch<t.batch;batch+=t.cores/(t.rowWorkers*t.mainWorkers)) {
             DataCacheCleanAndInvalid<float,CacheLine::ENTIRE_DATA_CACHE>(scratch);
             Duplicate(a,0.0f,512);
             for(uint64_t offset=0;offset<2*keyCount;offset+=512) {
@@ -704,11 +792,11 @@ public:
                 Store(scratch,offset,a,n);
             }
             uint32_t qlen=t.empty?0:Length(true,batch),klen=Length(false,batch);
-            if(vectorPairMain && qlen) {
+            if(t.mainWorkers==1 && vectorPairMain && qlen) {
                 LoadMatrix(mainKeys,k,static_cast<uint64_t>(batch)*t.keyRows*t.queryDim,t.keyRows*t.queryDim);
                 LoadMatrix(mainKeyRopes,kr,static_cast<uint64_t>(batch)*t.keyRows*t.ropeDim,t.keyRows*t.ropeDim);
             }
-            for(uint32_t row=GetBlockIdx()%t.rowWorkers;row<t.queryRows;row+=t.rowWorkers) {
+            for(uint32_t row=leader?logical%t.rowWorkers:t.queryRows;row<t.queryRows;row+=t.rowWorkers) {
                 uint64_t token=static_cast<uint64_t>(batch)*t.queryRows+row;
                 if(!vectorPairGrad)
                     for(uint32_t d=0;d<t.indexHeads*t.indexDim;++d) PutPair(qOffset+2*d,SliPair(0));
@@ -730,44 +818,46 @@ public:
                                     SliPair(pairVectorWork.GetValue(h),pairVectorWork.GetValue(1024+h)));
                         }
                     }
-                    pairMainReady=false;
-                    if (cachePairMain) {
-                        // The same high-precision score feeds max, sum, and sparse mass.
-                        if(vectorPairMain) PreparePairMain(batch,row,visible);
-                        else for(uint32_t h=0;h<t.queryHeads;++h) {
+                    if(t.mainWorkers==1) {
+                        pairMainReady=false;
+                        if (cachePairMain) {
+                            // The same high-precision score feeds max, sum, and sparse mass.
+                            if(vectorPairMain) PreparePairMain(batch,row,visible);
+                            else for(uint32_t h=0;h<t.queryHeads;++h) {
+                                for(int64_t key=0;key<visible;++key) {
+                                    SliPair value=PairMainRaw(batch,row,h,key);
+                                    uint32_t offset=2*(h*t.keyRows+key);
+                                    pairMainScores.SetValue(offset,value.hi);
+                                    pairMainScores.SetValue(offset+1,value.lo);
+                                }
+                            }
+                            pairMainReady=true;
+                        }
+                        // FP32 compatibility inputs may carry rounded statistics. Reconstruct
+                        // the visible normalizer with the same precision as the sparse scores.
+                        for(uint32_t h=0;h<t.queryHeads;++h) {
+                            SliPair mx(-3.4e38f),sm(0);
                             for(int64_t key=0;key<visible;++key) {
-                                SliPair value=PairMainRaw(batch,row,h,key);
-                                uint32_t offset=2*(h*t.keyRows+key);
-                                pairMainScores.SetValue(offset,value.hi);
-                                pairMainScores.SetValue(offset+1,value.lo);
+                                SliPair score=PairMain(batch,row,h,key);
+                                if(score>mx) mx=score;
+                            }
+                            if(vectorPairExp) {
+                                headNorm[h]=mx;
+                                for(int64_t key=0;key<visible;++key)
+                                    PairExpInput(h*visible+key,PairMain(batch,row,h,key)-mx);
+                            } else {
+                                for(int64_t key=0;key<visible;++key)
+                                    sm=sm+SliPairExp(PairMain(batch,row,h,key)-mx);
+                                headNorm[h]=mx+SliPairLog(sm);
                             }
                         }
-                        pairMainReady=true;
-                    }
-                    // FP32 compatibility inputs may carry rounded statistics. Reconstruct
-                    // the visible normalizer with the same precision as the sparse scores.
-                    for(uint32_t h=0;h<t.queryHeads;++h) {
-                        SliPair mx(-3.4e38f),sm(0);
-                        for(int64_t key=0;key<visible;++key) {
-                            SliPair score=PairMain(batch,row,h,key);
-                            if(score>mx) mx=score;
-                        }
-                        if(vectorPairExp) {
-                            headNorm[h]=mx;
-                            for(int64_t key=0;key<visible;++key)
-                                PairExpInput(h*visible+key,PairMain(batch,row,h,key)-mx);
-                        } else {
-                            for(int64_t key=0;key<visible;++key)
-                                sm=sm+SliPairExp(PairMain(batch,row,h,key)-mx);
-                            headNorm[h]=mx+SliPairLog(sm);
-                        }
-                    }
-                    if(vectorPairExp && visible>0) {
-                        PairExpBatch(t.queryHeads*visible);
-                        for(uint32_t h=0;h<t.queryHeads;++h) {
-                            SliPair sm(0);
-                            for(int64_t key=0;key<visible;++key) sm=sm+PairExpAt(h*visible+key);
-                            headInverse[h]=SliPair(1)/sm;
+                        if(vectorPairExp && visible>0) {
+                            PairExpBatch(t.queryHeads*visible);
+                            for(uint32_t h=0;h<t.queryHeads;++h) {
+                                SliPair sm(0);
+                                for(int64_t key=0;key<visible;++key) sm=sm+PairExpAt(h*visible+key);
+                                headInverse[h]=SliPair(1)/sm;
+                            }
                         }
                     }
                     bool cacheSparse=t.sparseSize<=256;
@@ -781,27 +871,33 @@ public:
                         ++validCount;
                         SliPair mh(-3.4e38f),mass(0),logit(0);
                         SliPair logmass(0);
-                        if(vectorPairExp) {
-                            for(uint32_t h=0;h<t.queryHeads;++h)
-                                mass=mass+PairExpAt(h*visible+key)*headInverse[h];
-                        }
-                        if(deferMass) { a.SetValue(2*j,mass.hi); a.SetValue(2*j+1,mass.lo); }
-                        if(vectorPairExp && mass.hi>1e-20f) {
-                            if(!deferMass) logmass=SliPairLog(mass);
+                        if(t.mainWorkers>1) {
+                            MergeParallelMass(j,mOffset,iOffset,mass,logmass);
+                            a.SetValue(2*j,mass.hi); a.SetValue(2*j+1,mass.lo);
+                            if(mass.hi<=1e-20f) linearTarget=false;
                         } else {
-                            linearTarget=false;
-                            if(vectorPairExp && !headLogReady) {
+                            if(vectorPairExp) {
                                 for(uint32_t h=0;h<t.queryHeads;++h)
-                                    headNorm[h]=headNorm[h]-SliPairLog(headInverse[h]);
-                                headLogReady=true;
+                                    mass=mass+PairExpAt(h*visible+key)*headInverse[h];
                             }
-                            mass=SliPair(0);
-                            for(uint32_t h=0;h<t.queryHeads;++h) {
-                                headScore[h]=PairMain(batch,row,h,key)-headNorm[h];
-                                if(headScore[h]>mh) mh=headScore[h];
+                            if(deferMass) { a.SetValue(2*j,mass.hi); a.SetValue(2*j+1,mass.lo); }
+                            if(vectorPairExp && mass.hi>1e-20f) {
+                                if(!deferMass) logmass=SliPairLog(mass);
+                            } else {
+                                linearTarget=false;
+                                if(vectorPairExp && !headLogReady) {
+                                    for(uint32_t h=0;h<t.queryHeads;++h)
+                                        headNorm[h]=headNorm[h]-SliPairLog(headInverse[h]);
+                                    headLogReady=true;
+                                }
+                                mass=SliPair(0);
+                                for(uint32_t h=0;h<t.queryHeads;++h) {
+                                    headScore[h]=PairMain(batch,row,h,key)-headNorm[h];
+                                    if(headScore[h]>mh) mh=headScore[h];
+                                }
+                                for(uint32_t h=0;h<t.queryHeads;++h) mass=mass+SliPairExp(headScore[h]-mh);
+                                logmass=mh+SliPairLog(mass);
                             }
-                            for(uint32_t h=0;h<t.queryHeads;++h) mass=mass+SliPairExp(headScore[h]-mh);
-                            logmass=mh+SliPairLog(mass);
                         }
                         PutPair(mOffset+2*j,logmass);
                         if(logmass>maxMass) maxMass=logmass;
