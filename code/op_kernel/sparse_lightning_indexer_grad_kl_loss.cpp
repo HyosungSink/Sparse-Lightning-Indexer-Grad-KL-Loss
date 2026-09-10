@@ -118,6 +118,8 @@ class SparseGrad {
     TBuf<TPosition::VECCALC> storage;
     LocalTensor<float> a, b, product, temporary, result, qiCache, dqCache, keyCache, dkCache, gradTemp, weightOut;
     LocalTensor<uint8_t> raw;
+    LocalTensor<float> mainQuery, mainRope, mainKeys, mainKeyRopes;
+    bool cachedMain;
     uint32_t stride;
     uint64_t simOffset, massOffset, logitOffset;
 
@@ -164,6 +166,35 @@ class SparseGrad {
         return (Dot(q, qo*t.queryDim, k, ko*t.queryDim, t.queryDim) +
                 Dot(qr, qo*t.ropeDim, kr, ko*t.ropeDim, t.ropeDim)) * t.scale;
     }
+    template<class U>
+    __aicore__ inline void LoadMatrix(LocalTensor<float> dst, GlobalTensor<U> src,
+                                     uint64_t offset, uint32_t count) {
+        for (uint32_t start=0; start<count; start+=1024) {
+            uint32_t n=count-start<1024?count-start:1024;
+            Load(dst[start],src,offset+start,n);
+        }
+    }
+    __aicore__ inline void MainScores(uint32_t batch, uint32_t row, uint32_t key, float *scores) {
+        if (!cachedMain) {
+            for (uint32_t h=0; h<t.queryHeads; ++h) scores[h]=MainScore(batch,row,h,key);
+            return;
+        }
+        uint8_t span=static_cast<uint8_t>(t.queryDim/8);
+        Mul(product,mainQuery,mainKeys[key*t.queryDim],static_cast<uint64_t>(t.queryDim),
+            static_cast<uint8_t>(t.queryHeads),{1,1,1,span,span,0});
+        PipeBarrier<PIPE_V>();
+        WholeReduceSum(result,product,t.queryDim,t.queryHeads,1,1,span);
+        PipeBarrier<PIPE_ALL>();
+        for (uint32_t h=0; h<t.queryHeads; ++h) scores[h]=result.GetValue(h);
+        span=static_cast<uint8_t>(t.ropeDim/8);
+        Mul(product,mainRope,mainKeyRopes[key*t.ropeDim],static_cast<uint64_t>(t.ropeDim),
+            static_cast<uint8_t>(t.queryHeads),{1,1,1,span,span,0});
+        PipeBarrier<PIPE_V>();
+        WholeReduceSum(result,product,t.ropeDim,t.queryHeads,1,1,span);
+        PipeBarrier<PIPE_ALL>();
+        for (uint32_t h=0; h<t.queryHeads; ++h)
+            scores[h]=(scores[h]+result.GetValue(h))*t.scale;
+    }
     __aicore__ inline uint32_t Length(bool query, uint32_t batch) {
         uint32_t type = query ? t.queryLengthType : t.keyLengthType;
         uint32_t bound = query ? t.queryRows : t.keyRows;
@@ -197,13 +228,22 @@ public:
         losses.SetGlobalBuffer((__gm__ float*)workspace + t.cores*t.batchScratch);
         stride = (t.indexDim + 7)/8*8;
         uint32_t cacheSize = t.indexHeads*stride;
-        pipe.InitBuffer(storage, (2*cacheSize + 512*8 + 128*4 + 64)*sizeof(float));
+        cachedMain = !AscendC::IsSameType<T,float>::value &&
+            t.queryDim<=64 && t.ropeDim<=64 && t.queryDim%8==0 && t.ropeDim%8==0 &&
+            t.queryHeads*t.queryDim<=1024 && t.queryHeads*t.ropeDim<=256 &&
+            static_cast<uint64_t>(t.keyRows)*t.queryDim<=4096 &&
+            static_cast<uint64_t>(t.keyRows)*t.ropeDim<=1024;
+        pipe.InitBuffer(storage, (2*cacheSize + 512*8 + 128*4 + 64 + (cachedMain?6400:0))*sizeof(float));
         auto mem = storage.Get<float>();
         a = mem; b = mem[512]; product = mem[1024]; temporary = mem[1536]; result = mem[2048];
         raw = mem[2560].ReinterpretCast<uint8_t>();
         qiCache = mem[3072]; dqCache = mem[3072+cacheSize];
         keyCache = mem[3072+2*cacheSize]; dkCache = keyCache[128];
         gradTemp = dkCache[128]; weightOut = gradTemp[128];
+        if (cachedMain) {
+            mainQuery=weightOut[128]; mainRope=mainQuery[1024];
+            mainKeys=mainRope[256]; mainKeyRopes=mainKeys[4096];
+        }
         simOffset = (static_cast<uint64_t>(t.keyRows)*t.indexDim+15)/16*16;
         massOffset = simOffset + static_cast<uint64_t>(t.sparseSize)*t.indexHeads;
         logitOffset = massOffset + t.sparseSize;
@@ -381,12 +421,20 @@ public:
                 Store(scratch, offset, a, n);
             }
             uint32_t qlen = t.empty ? 0 : Length(true,batch), klen = Length(false,batch);
+            if (cachedMain && qlen) {
+                LoadMatrix(mainKeys,k,static_cast<uint64_t>(batch)*t.keyRows*t.queryDim,t.keyRows*t.queryDim);
+                LoadMatrix(mainKeyRopes,kr,static_cast<uint64_t>(batch)*t.keyRows*t.ropeDim,t.keyRows*t.ropeDim);
+            }
             for (uint32_t row = GetBlockIdx()%t.rowWorkers; row < t.queryRows; row += t.rowWorkers) {
                 Duplicate(dqCache, 0.0f, t.indexHeads*stride);
                 Duplicate(weightOut, 0.0f, 64);
                 PipeBarrier<PIPE_ALL>();
                 uint64_t token = static_cast<uint64_t>(batch)*t.queryRows+row;
                 if (row < qlen) {
+                    if (cachedMain) {
+                        Load(mainQuery,q,token*t.queryHeads*t.queryDim,t.queryHeads*t.queryDim);
+                        Load(mainRope,qr,token*t.queryHeads*t.ropeDim,t.queryHeads*t.ropeDim);
+                    }
                     for (uint32_t h=0; h<t.indexHeads; ++h)
                         Load(qiCache[h*stride], qi, (token*t.indexHeads+h)*t.indexDim, t.indexDim);
                     float headMax[128], headSum[128], score[128], weight[64], dwSum[64], dwCorr[64];
@@ -419,8 +467,9 @@ public:
                         if (!Valid(key,row,qlen,klen)) continue;
                         ++validCount;
                         float mh=-3.4e38f;
+                        MainScores(batch,row,key,score);
                         for(uint32_t h=0;h<t.queryHeads;++h) {
-                            score[h]=MainScore(batch,row,h,key)-headMax[h]-SliLog(headSum[h]);
+                            score[h]=score[h]-headMax[h]-SliLog(headSum[h]);
                             if(score[h]>mh) mh=score[h];
                         }
                         float mass=0, mc=0;
